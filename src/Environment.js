@@ -1,16 +1,11 @@
 // @flow
 
 import {Environment, Network, RecordSource, Store} from 'relay-runtime';
-import RelayQueryResponseCache from './relayResponseCache';
 import Cookies from 'universal-cookie';
+import config from './config';
+import PreloadCache from './preloadQueryCache';
 
 import OneGraphAuth from 'onegraph-auth';
-
-const ONEGRAPH_APP_ID = process.env.RAZZLE_ONEGRAPH_APP_ID;
-
-if (!ONEGRAPH_APP_ID) {
-  throw new Error('Must add RAZZLE_ONEGRAPH_APP_ID to .env');
-}
 
 class AuthDummy {
   isLoggedIn(x: any) {
@@ -25,30 +20,35 @@ class AuthDummy {
   logout(x: any) {
     return Promise.resolve(null);
   }
+  destroy() {
+    return null;
+  }
 }
 
 class CookieStorage {
   _cookies: Cookies = new Cookies();
-  getItem = (key: string): ?string => {
-    return this._cookies.get(key, {doNotParse: true});
-  };
-  setItem = (key: string, value: string): void => {
-    const options = {
+  _getOptions = () => {
+    return {
       path: '/',
       secure: process.env.NODE_ENV === 'development' ? false : true,
       sameSite: 'strict',
       expires: new Date(Date.now() + 1000 * 60 * 60 * 24 * 7), // 1 week
     };
-    this._cookies.set(key, value, options);
+  };
+  getItem = (key: string): ?string => {
+    return this._cookies.get(key, {doNotParse: true});
+  };
+  setItem = (key: string, value: string): void => {
+    this._cookies.set(key, value, this._getOptions());
   };
   removeItem = (key: string): void => {
-    this._cookies.remove(key);
+    this._cookies.remove(key, this._getOptions());
   };
 }
 
 export const onegraphAuth = global.window
   ? new OneGraphAuth({
-      appId: ONEGRAPH_APP_ID,
+      appId: config.appId,
       communicationMode: 'post_message',
       storage: new CookieStorage(),
     })
@@ -58,7 +58,54 @@ function getQueryId(operation) {
   return operation.id || operation.text;
 }
 
-function makeFetchQuery(cache, headers?: ?{[key: string]: string}) {
+async function sendRequest({onegraphAuth, headers, requestBody}) {
+  const response = await fetch(
+    'https://serve.onegraph.com/graphql?app_id=' + config.appId,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        ...onegraphAuth.authHeaders(),
+        // $FlowFixMe
+        ...(headers ? headers : {}),
+      },
+      body: requestBody,
+    },
+  );
+  return await response.json();
+}
+
+async function checkifCorsRequired(): Promise<boolean> {
+  try {
+    const response = await fetch(
+      'https://serve.onegraph.com/is-cors-origin-allowed?app_id=' +
+        config.appId,
+    );
+    const json = await response.json();
+    return !json.allowed;
+  } catch (e) {
+    console.error('Error checking if CORS required');
+    return false;
+  }
+}
+
+// Fix problem where relay gets nonnull `data` field and does weird things to the cache
+function maybeNullOutQuery(json) {
+  if (json.data && !json.data.gitHub) {
+    return {
+      ...json,
+      data: null,
+    };
+  }
+  return json;
+}
+
+function makeFetchQuery(
+  headers?: ?{[key: string]: string},
+  preloadCache: ?PreloadCache,
+  getEnvironment,
+) {
   return async function fetchQuery(operation, rawVariables, cacheConfig) {
     const variables = {};
     // Bit of a hack to prevent Relay from sending null values for variables
@@ -70,13 +117,8 @@ function makeFetchQuery(cache, headers?: ?{[key: string]: string}) {
     }
     const queryId = getQueryId(operation);
     const forceFetch = cacheConfig && cacheConfig.force;
-    const fromCache = cache.get(queryId, variables);
     const isMutation = operation.operationKind === 'mutation';
     const isQuery = operation.operationKind === 'query';
-
-    if (isQuery && fromCache !== null && !forceFetch) {
-      return fromCache;
-    }
 
     const requestBody = JSON.stringify({
       doc_id: operation.id,
@@ -84,61 +126,67 @@ function makeFetchQuery(cache, headers?: ?{[key: string]: string}) {
       variables,
     });
 
-    const resp = fetch(
-      'https://serve.onegraph.com/graphql?app_id=' + ONEGRAPH_APP_ID,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          ...onegraphAuth.authHeaders(),
-          ...(headers ? headers : {}),
-        },
-        body: requestBody,
-      },
-    ).then(response =>
-      response.json().then(json => {
-        // Clear full cache on mutation or if we get an error
-        if (isMutation || !json.data || !json.data.gitHub) {
-          cache.clear();
-        }
-        if (json.data.gitHub == null) {
-          return {
-            ...json,
-            data: null,
-          };
-        }
-        return json;
-      }),
-    );
+    const appId = config.appId;
 
-    // TODO: clear auth on 401
-    if (isQuery) {
-      cache.set(queryId, variables, resp);
+    try {
+      const json = await sendRequest({
+        onegraphAuth,
+        headers,
+        requestBody,
+      });
+
+      if (isMutation && preloadCache) {
+        getEnvironment();
+        preloadCache.clear(getEnvironment());
+      }
+
+      if (
+        json.errors &&
+        (headers || Object.keys(onegraphAuth.authHeaders()).length)
+      ) {
+        // Clear auth on any error and try again
+        onegraphAuth.destroy();
+        const newJson = await sendRequest({
+          onegraphAuth,
+          headers: {},
+          requestBody,
+        });
+        return maybeNullOutQuery(newJson);
+      } else {
+        return maybeNullOutQuery(json);
+      }
+    } catch (e) {
+      if (typeof window !== 'undefined') {
+        const isCorsRequired = await checkifCorsRequired();
+        if (isCorsRequired) {
+          const error = new Error('Missing CORS origin.');
+          (error: any).type = 'missing-cors';
+          throw error;
+        }
+      }
+      throw e;
     }
-    return await resp;
   };
 }
 
 export function createEnvironment(
   recordSource: RecordSource,
-  cache: RelayQueryResponseCache,
   headers?: ?{[key: string]: string},
+  preloadCache: ?PreloadCache,
 ) {
-  return new Environment({
-    network: Network.create(makeFetchQuery(cache, headers)),
-    store: new Store(recordSource),
+  const store = new Store(recordSource);
+  let environment;
+  const getEnvironment = () => environment;
+  environment = new Environment({
+    network: Network.create(
+      makeFetchQuery(headers, preloadCache, getEnvironment),
+    ),
+    store,
   });
+  return environment;
 }
 
-const recordSource =
+export const recordSource =
   typeof window !== 'undefined' && window.__RELAY_BOOTSTRAP_DATA__
     ? new RecordSource(window.__RELAY_BOOTSTRAP_DATA__)
     : new RecordSource();
-
-const defaultCache = new RelayQueryResponseCache({
-  size: 250,
-  ttl: 1000 * 60 * 10,
-});
-
-export const environment = createEnvironment(recordSource, defaultCache);

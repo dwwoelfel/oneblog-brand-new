@@ -1,30 +1,25 @@
 // @flow
 
 import React from 'react';
-import {matchPath} from 'react-router-dom';
-import {HashLink} from 'react-router-hash-link';
+import {Link} from '@reach/router';
+import {pick} from '@reach/router/lib/utils';
 import {routes} from './App';
 import {fetchQuery} from 'react-relay';
-import {environment} from './Environment';
+import {useRelayEnvironment} from 'react-relay/hooks';
+import PreloadCacheContext from './PreloadCacheContext';
 
-async function runQueryForLink(to) {
-  for (const routeConfig of routes) {
-    const match = matchPath(to, routeConfig);
-    if (match) {
-      // Puts the query into the store
-      fetchQuery(
-        environment,
-        routeConfig.query,
-        routeConfig.getVariables(match),
-      );
-      break;
-    }
+async function runQueryForLink(cache, environment, to) {
+  const match = pick(routes, to);
+  if (match) {
+    match.route.preload(cache, environment, match.params);
   }
 }
 
 export default function PreloadLink(props: any) {
+  const cache = React.useContext(PreloadCacheContext);
+  const environment = useRelayEnvironment();
   const preload = () => {
-    runQueryForLink(props.to);
+    runQueryForLink(cache, environment, props.to);
   };
-  return <HashLink onClick={preload} onMouseOver={preload} {...props} />;
+  return <Link onClick={preload} onMouseOver={preload} {...props} />;
 }

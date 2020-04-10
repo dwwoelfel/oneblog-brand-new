@@ -2,7 +2,8 @@
 
 import App, {routes} from './App';
 import React from 'react';
-import {StaticRouter, matchPath} from 'react-router-dom';
+import {ServerLocation, isRedirect} from '@reach/router';
+import {pick} from '@reach/router/lib/utils';
 import {ServerStyleSheet} from 'styled-components';
 import express from 'express';
 import cookieParser from 'cookie-parser';
@@ -11,10 +12,12 @@ import {fetchQuery} from 'react-relay';
 import {createEnvironment} from './Environment';
 import serialize from 'serialize-javascript';
 import {RecordSource} from 'relay-runtime';
-import RelayQueryResponseCache from './relayResponseCache';
+import PreloadCacheContext from './PreloadCacheContext';
+import PreloadCache from './preloadQueryCache';
 import {buildFeed} from './RssFeed';
 import {imageProxy, firstFrame} from './imageProxy';
 import {Helmet} from 'react-helmet';
+import config from './config';
 
 // $FlowFixMe
 const assets = require(process.env.RAZZLE_ASSETS_MANIFEST);
@@ -91,6 +94,40 @@ function buildHtml({
 </html>`;
 }
 
+const MEDIUM_REGEX = /[0-9a-f]{8,16}$/;
+
+function getMediumId(req) {
+  const path = req.path;
+
+  if (!path) {
+    return null;
+  }
+  const match = path.match(MEDIUM_REGEX);
+
+  if (match && match[0]) {
+    return match[0];
+  }
+  return null;
+}
+
+async function findMediumRedirect(req): Promise<?number> {
+  const mediumId = getMediumId(req);
+  if (mediumId) {
+    try {
+      const res = await fetch(
+        `https://medium-oneblog-importer-o3e76jeu3q-uc.a.run.app/redirects/${config.repoOwner}/${config.repoName}/${mediumId}`,
+      );
+      const json = await res.json();
+      if (json.status === 'found' && json.issue && json.issue.number) {
+        return json.issue.number;
+      }
+    } catch (e) {
+      console.error('Error finding Medium redirect', e);
+      return null;
+    }
+  }
+}
+
 const SUPPORTED_FEED_EXTENSIONS = ['rss', 'atom', 'json'];
 
 function createApp(basePath: ?string) {
@@ -123,15 +160,16 @@ function createApp(basePath: ?string) {
     })
     .get('/*', async (req, res) => {
       try {
+        const mediumRedirectIssueNumber = await findMediumRedirect(req);
+        if (mediumRedirectIssueNumber) {
+          res.redirect(301, `/post/${mediumRedirectIssueNumber}`);
+          return;
+        }
         const recordSource = new RecordSource();
-        const cache = new RelayQueryResponseCache({
-          size: 250,
-          ttl: 1000 * 60 * 10,
-        });
 
         let accessToken;
         try {
-          const cookie = req.cookies[process.env.RAZZLE_ONEGRAPH_APP_ID];
+          const cookie = req.cookies[config.appId];
           if (cookie) {
             accessToken = JSON.parse(cookie).accessToken;
           }
@@ -139,71 +177,75 @@ function createApp(basePath: ?string) {
           console.error('Error parsing cookie', e);
         }
 
+        const cache = new PreloadCache({size: 10, ttl: 1000 * 60 * 60});
         const environment = createEnvironment(
           recordSource,
-          cache,
           accessToken ? {Authorization: `Bearer ${accessToken}`} : null,
+          cache,
         );
 
         // Prep cache
-        for (const routeConfig of routes) {
-          const match = matchPath(req.path, routeConfig);
-          if (match) {
-            // Makes relay put result of the query into the record store
-            await fetchQuery(
-              environment,
-              routeConfig.query,
-              routeConfig.getVariables(match),
-            );
-            break;
-          }
+        const match = pick(routes, req.url);
+        if (match) {
+          await new Promise((resolve, reject) => {
+            match.route
+              .preload(cache, environment, match.params)
+              .source.subscribe({
+                complete: () => {
+                  resolve();
+                },
+                error: e => reject(e),
+              });
+          });
         }
 
         const sheet = new ServerStyleSheet();
-        const context = {};
 
         const markup = renderToString(
           sheet.collectStyles(
-            <StaticRouter context={context} location={req.url}>
-              <App environment={environment} />
-            </StaticRouter>,
+            <ServerLocation url={req.url}>
+              <PreloadCacheContext.Provider value={cache}>
+                <App environment={environment} basepath={basePath || '/'} />
+              </PreloadCacheContext.Provider>
+            </ServerLocation>,
           ),
         );
         const helmet = Helmet.renderStatic();
         const styleTags = sheet.getStyleTags();
-        if (context.url) {
-          res.redirect(context.url);
+        if (accessToken) {
+          res.set('Cache-Control', 'private, max-age=3600, s-maxage=3600');
         } else {
-          if (accessToken) {
-            res.set('Cache-Control', 'private, max-age=3600, s-maxage=3600');
-          } else {
-            res.set('Cache-Control', 'public, max-age=3600, s-maxage=3600');
-          }
+          res.set('Cache-Control', 'public, max-age=3600, s-maxage=3600');
+        }
+        res.status(200).send(
+          buildHtml({
+            markup,
+            styleTags,
+            bootstrapData: recordSource.toJSON(),
+            basePath,
+            htmlAttributes: helmet.htmlAttributes.toString(),
+            title: helmet.title.toString(),
+            meta: helmet.meta.toString(),
+          }),
+        );
+      } catch (e) {
+        if (isRedirect(e)) {
+          res.redirect(e.uri);
+        } else {
+          console.error(e);
+
           res.status(200).send(
             buildHtml({
-              markup,
-              styleTags,
-              bootstrapData: recordSource.toJSON(),
+              markup: null,
+              styleTags: null,
+              bootstrapData: null,
               basePath,
-              htmlAttributes: helmet.htmlAttributes.toString(),
-              title: helmet.title.toString(),
-              meta: helmet.meta.toString(),
+              htmlAttributes: '',
+              title: '',
+              meta: '',
             }),
           );
         }
-      } catch (e) {
-        console.error(e);
-        res.status(200).send(
-          buildHtml({
-            markup: null,
-            styleTags: null,
-            bootstrapData: null,
-            basePath,
-            htmlAttributes: '',
-            title: '',
-            meta: '',
-          }),
-        );
       }
     });
 

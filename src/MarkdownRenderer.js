@@ -2,6 +2,7 @@
 
 import React from 'react';
 import ReactMarkdown from 'react-markdown/with-html';
+import Embed from 'react-embed';
 import htmlParser from 'react-markdown/plugins/html-parser';
 import type SyntaxHighlighter from 'react-syntax-highlighter';
 import GifPlayer from './GifPlayer';
@@ -12,6 +13,7 @@ import {Heading} from 'grommet/components/Heading';
 import {Image as GrommetImage} from 'grommet/components/Image';
 import {Box} from 'grommet/components/Box';
 import {Text} from 'grommet/components/Text';
+import {ResponsiveContext} from 'grommet/contexts/ResponsiveContext';
 import emoji from './emoji';
 
 type Props = {
@@ -108,8 +110,13 @@ function PlainImage(imageProps) {
   );
 }
 
+function isGif(src: string) {
+  const srcUrl = new URL(src);
+  return srcUrl.pathname.endsWith('gif');
+}
+
 function Image(props) {
-  if (props.src && props.src.endsWith('gif')) {
+  if (props.src && isGif(props.src)) {
     return <GifPlayer style={{maxWidth: '100%'}} src={props.src} />;
   }
   return <PlainImage {...props} />;
@@ -161,7 +168,18 @@ export function emojify(s: string): string {
   return emojified;
 }
 
+function Link(props) {
+  return <Anchor {...props} />;
+}
+
 const defaultRenderers = ({SyntaxHighlighter}) => ({
+  blockquote(props) {
+    return (
+      <Text color="dark-3">
+        <blockquote {...props} />
+      </Text>
+    );
+  },
   text(props) {
     const text = props.children;
     return emojify(text);
@@ -170,11 +188,50 @@ const defaultRenderers = ({SyntaxHighlighter}) => ({
     return <CodeBlock SyntaxHighlighter={SyntaxHighlighter} {...props} />;
   },
   image: Image,
-  paragraph: P,
-  heading: Heading,
-  link(props) {
-    return <Anchor {...props} />;
+  paragraph(props) {
+    const size = React.useContext(ResponsiveContext);
+    if (typeof window === 'undefined') {
+      return <P {...props} />;
+    }
+    const isLink =
+      props.children &&
+      props.children.length === 1 &&
+      props.children[0].type === Link;
+
+    if (isLink) {
+      const link = props.children[0];
+      const isSelfLink =
+        link.props.href &&
+        link.props.children &&
+        link.props.children.length === 1 &&
+        link.props.children[0].props &&
+        link.props.children[0].props.value === link.props.href;
+      if (isSelfLink) {
+        const a = link;
+        return (
+          <Embed
+            url={link.props.href}
+            fallback={<P {...props} />}
+            renderVoid={() => <P {...props} />}
+            renderWrap={x => (
+              // Don't try to center on mobile -- bug with twitter embed will cause it to shift to the right
+              <Box
+                margin={{vertical: 'large'}}
+                align={size === 'small' ? null : 'center'}>
+                {x}
+              </Box>
+            )}
+          />
+        );
+      }
+    }
+
+    return <P {...props} />;
   },
+  heading(props) {
+    return <Heading {...props} level={props.level + 1} />;
+  },
+  link: Link,
   linkReference(props) {
     return <Anchor {...props} />;
   },

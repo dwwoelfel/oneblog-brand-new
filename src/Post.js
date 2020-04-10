@@ -8,6 +8,7 @@ import {
   fetchQuery,
   type RelayProp,
 } from 'react-relay';
+import {useRelayEnvironment} from 'react-relay/hooks';
 import MarkdownRenderer from './MarkdownRenderer';
 import formatDate from 'date-fns/format';
 import EmojiIcon from './emojiIcon';
@@ -15,7 +16,7 @@ import AddIcon from './addIcon';
 import Tippy, {TippyGroup} from '@tippy.js/react';
 import 'tippy.js/themes/light-border.css';
 import Link from './PreloadLink';
-import {postRootQuery} from './App';
+import {postRoute} from './App';
 import GitHubLoginButton from './GitHubLoginButton';
 import {NotificationContext} from './Notifications';
 import {Box} from 'grommet/components/Box';
@@ -28,6 +29,7 @@ import unified from 'unified';
 import parse from 'remark-parse';
 import imageUrl from './imageUrl';
 import {Helmet} from 'react-helmet';
+import PreloadCacheContext from './PreloadCacheContext';
 
 import type {Post_post} from './__generated__/Post_post.graphql';
 
@@ -225,9 +227,10 @@ type Props = {
 export function PostBox({children}: {children: React.Node}) {
   return (
     <Box
-      margin="medium"
+      pad="medium"
       style={{
         maxWidth: 704,
+        width: '100%',
         borderRadius: 2,
       }}>
       {children}
@@ -237,19 +240,19 @@ export function PostBox({children}: {children: React.Node}) {
 
 export const ReactionBar = ({
   reactionGroups,
-  relay,
   subjectId,
   pad,
 }: {
   reactionGroups: *,
-  relay: RelayProp,
   subjectId: string,
   pad?: string,
 }) => {
+  const environment = useRelayEnvironment();
   const {error: notifyError} = React.useContext(NotificationContext);
   const [showReactionPopover, setShowReactionPopover] = React.useState(false);
   const popoverInstance = React.useRef();
-  const {isLoggedIn, login} = React.useContext(UserContext);
+  const {loginStatus, login} = React.useContext(UserContext);
+  const isLoggedIn = loginStatus === 'logged-in';
 
   const usedReactions = (reactionGroups || []).filter(
     g => g.users.totalCount > 0,
@@ -334,7 +337,7 @@ export const ReactionBar = ({
                 popoverInstance.current && popoverInstance.current.hide();
                 try {
                   await removeReaction({
-                    environment: relay.environment,
+                    environment,
                     content,
                     subjectId,
                   });
@@ -346,7 +349,7 @@ export const ReactionBar = ({
                 popoverInstance.current && popoverInstance.current.hide();
                 try {
                   await addReaction({
-                    environment: relay.environment,
+                    environment,
                     content,
                     subjectId,
                   });
@@ -362,7 +365,10 @@ export const ReactionBar = ({
           className="add-reaction-emoji"
           onClick={() => setShowReactionPopover(!showReactionPopover)}>
           <AddIcon width="12" />
-          <EmojiIcon width="24" style={{stroke: 'rgba(0,0,0,0)'}} />
+          <EmojiIcon
+            width="24"
+            style={{marginLeft: 2, stroke: 'rgba(0,0,0,0)'}}
+          />
         </span>
       </Tippy>
     </Box>
@@ -433,11 +439,19 @@ export function computePostDate(post: {
 }
 
 export const Post = ({relay, post, context}: Props) => {
+  const environment = useRelayEnvironment();
+  const cache = React.useContext(PreloadCacheContext);
+  React.useEffect(() => {
+    if (context === 'list') {
+      postRoute.preload(cache, environment, {issueNumber: post.number});
+    }
+  }, [cache, environment, context]);
   const {error: notifyError} = React.useContext(NotificationContext);
   const [showReactionPopover, setShowReactionPopover] = React.useState(false);
   const postDate = React.useMemo(() => computePostDate(post), [post]);
   const popoverInstance = React.useRef();
-  const {isLoggedIn, login} = React.useContext(UserContext);
+  const {loginStatus, login} = React.useContext(UserContext);
+  const isLoggedIn = loginStatus === 'logged-in';
 
   const usedReactions = (post.reactionGroups || []).filter(
     g => g.users.totalCount > 0,
@@ -445,22 +459,12 @@ export const Post = ({relay, post, context}: Props) => {
   const authors = post.assignees.nodes || [];
   return (
     <PostBox>
-      <Helmet>
-        <title>{post.title}</title>
-      </Helmet>
       <Box pad="medium">
         <Heading level={1} margin="none">
           {context === 'details' ? (
             post.title
           ) : (
-            <Link
-              style={{color: 'inherit'}}
-              to={postPath({post})}
-              onMouseOver={() =>
-                fetchQuery(relay.environment, postRootQuery, {
-                  issueNumber: post.number,
-                })
-              }>
+            <Link style={{color: 'inherit'}} to={postPath({post})}>
               {post.title}
             </Link>
           )}
@@ -532,7 +536,7 @@ export default createFragmentContainer(Post, {
           id
           name
           login
-          avatarUrl
+          avatarUrl(size: 96)
           url
         }
       }
@@ -554,7 +558,7 @@ export default createFragmentContainer(Post, {
         name
         owner {
           login
-          avatarUrl(size: 192)
+          avatarUrl(size: 96)
         }
       }
     }
